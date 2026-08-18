@@ -462,6 +462,16 @@ if (!identical(process$raw_state, current_hash)) {
               show_col_types = FALSE)
       )
       names(df)[match(select_actual, names(df))] <- rename_to
+      # Some component CSVs (e.g. the 2024 edition's "geo" file) drop the
+      # leading zero on fips_st_cnty for states 01-09, giving a 4-char code
+      # ("1001") instead of 5 ("01001"). Left uncorrected here, the later
+      # Reduce(left_join, ...) across components fails to match those rows
+      # against components that kept the leading zero, silently NA-ing out
+      # every measure except the ones sourced from this file. Normalize
+      # before returning so every component joins on the same key.
+      df$fips_st_cnty <- ifelse(
+        nchar(df$fips_st_cnty) == 4L, paste0("0", df$fips_st_cnty), df$fips_st_cnty
+      )
       df
     }, error = function(e) NULL)
   }
@@ -570,12 +580,174 @@ if (!identical(process$raw_state, current_hash)) {
   }
 
   # -------------------------------------------------------------------------
-  # 6. Combine and write
+  # 6. Combine, resolve known Alaska disagreements, aggregate to state and
+  #    national, and write. AHRF is natively county-only (fips_st_cnty), so
+  #    state/national rows are computed here rather than provided by HRSA --
+  #    mixed into the same standard/data.csv.gz by geography length (5 =
+  #    county, 2 = state, "00" = national), matching every other multi-level
+  #    source in this pipeline (e.g. NSSP, CMS MMD) rather than shipping
+  #    separate per-level files.
   # -------------------------------------------------------------------------
   if (length(year_dfs) > 0L) {
     data_standard <- bind_rows(year_dfs) %>% arrange(geography, time)
+
+    # Retired Alaska borough/census-area FIPS codes for which AHRF sometimes
+    # duplicates and sometimes disagrees with the current successor(s) for
+    # the same (measure, time) -- see git history for how each row below was
+    # resolved. Applied here, at the source, so every consumer (county rows
+    # in this file, and the state/national aggregates below) gets clean,
+    # non-duplicated data rather than each downstream repo needing its own
+    # copy of this table.
+    ahrf_alaska_overrides <- tribble(
+      ~geography, ~measure,                    ~time,
+      "02063",    "ahrf_critical_access_hosp", "2023-12-31",
+      "02063",    "ahrf_hospitals",            "2023-12-31",
+      "02063",    "ahrf_hpsa_dental",          "2025-12-31",
+      "02063",    "ahrf_hpsa_mental_health",   "2025-12-31",
+      "02063",    "ahrf_hpsa_prim_care",       "2025-12-31",
+      "02066",    "ahrf_critical_access_hosp", "2023-12-31",
+      "02066",    "ahrf_hospitals",            "2023-12-31",
+      "02066",    "ahrf_hpsa_dental",          "2025-12-31",
+      "02066",    "ahrf_hpsa_mental_health",   "2025-12-31",
+      "02066",    "ahrf_hpsa_prim_care",       "2025-12-31",
+      "02105",    "ahrf_population",           "2011-12-31",
+      "02105",    "ahrf_population",           "2012-12-31",
+      "02195",    "ahrf_md_all",               "2011-12-31",
+      "02195",    "ahrf_md_all",               "2012-12-31",
+      "02195",    "ahrf_population",           "2011-12-31",
+      "02195",    "ahrf_population",           "2012-12-31",
+      "02198",    "ahrf_md_all",               "2011-12-31",
+      "02198",    "ahrf_md_all",               "2012-12-31",
+      "02198",    "ahrf_population",           "2011-12-31",
+      "02198",    "ahrf_population",           "2012-12-31",
+      "02201",    "ahrf_critical_access_hosp", "2011-12-31",
+      "02201",    "ahrf_critical_access_hosp", "2012-12-31",
+      "02201",    "ahrf_dentists",             "2011-12-31",
+      "02201",    "ahrf_dentists",             "2012-12-31",
+      "02201",    "ahrf_good_air_pct",         "2012-12-31",
+      "02201",    "ahrf_hospitals",            "2011-12-31",
+      "02201",    "ahrf_hospitals",            "2012-12-31",
+      "02201",    "ahrf_pcp",                  "2011-12-31",
+      "02201",    "ahrf_pcp",                  "2012-12-31",
+      "02201",    "ahrf_pm25",                 "2012-12-31",
+      "02201",    "ahrf_pop_density",          "2011-12-31",
+      "02201",    "ahrf_pop_density",          "2012-12-31",
+      "02201",    "ahrf_psych",                "2011-12-31",
+      "02201",    "ahrf_psych",                "2012-12-31",
+      "02201",    "ahrf_rural_urban_code",     "2011-12-31",
+      "02201",    "ahrf_rural_urban_code",     "2012-12-31",
+      "02230",    "ahrf_population",           "2011-12-31",
+      "02230",    "ahrf_population",           "2012-12-31",
+      "02232",    "ahrf_critical_access_hosp", "2011-12-31",
+      "02232",    "ahrf_critical_access_hosp", "2012-12-31",
+      "02232",    "ahrf_dentists",             "2011-12-31",
+      "02232",    "ahrf_dentists",             "2012-12-31",
+      "02232",    "ahrf_good_air_pct",         "2012-12-31",
+      "02232",    "ahrf_hospitals",            "2011-12-31",
+      "02232",    "ahrf_hospitals",            "2012-12-31",
+      "02232",    "ahrf_md_all",               "2011-12-31",
+      "02232",    "ahrf_md_all",               "2012-12-31",
+      "02232",    "ahrf_medicare_per_capita",  "2014-12-31",
+      "02232",    "ahrf_pcp",                  "2011-12-31",
+      "02232",    "ahrf_pcp",                  "2012-12-31",
+      "02232",    "ahrf_pm25",                 "2012-12-31",
+      "02232",    "ahrf_pop_density",          "2011-12-31",
+      "02232",    "ahrf_pop_density",          "2012-12-31",
+      "02232",    "ahrf_psych",                "2011-12-31",
+      "02232",    "ahrf_psych",                "2012-12-31",
+      "02232",    "ahrf_rural_urban_code",     "2011-12-31",
+      "02232",    "ahrf_rural_urban_code",     "2012-12-31",
+      "02261",    "ahrf_critical_access_hosp", "2024-12-31",
+      "02261",    "ahrf_hospitals",            "2024-12-31",
+      "02261",    "ahrf_critical_access_hosp", "2025-12-31",
+      "02261",    "ahrf_hospitals",            "2025-12-31",
+      "02275",    "ahrf_md_all",               "2011-12-31",
+      "02275",    "ahrf_md_all",               "2012-12-31",
+      "02275",    "ahrf_population",           "2011-12-31",
+      "02275",    "ahrf_population",           "2012-12-31",
+      "02280",    "ahrf_critical_access_hosp", "2011-12-31",
+      "02280",    "ahrf_critical_access_hosp", "2012-12-31",
+      "02280",    "ahrf_dentists",             "2011-12-31",
+      "02280",    "ahrf_dentists",             "2012-12-31",
+      "02280",    "ahrf_good_air_pct",         "2012-12-31",
+      "02280",    "ahrf_hospitals",            "2011-12-31",
+      "02280",    "ahrf_hospitals",            "2012-12-31",
+      "02280",    "ahrf_pcp",                  "2011-12-31",
+      "02280",    "ahrf_pcp",                  "2012-12-31",
+      "02280",    "ahrf_pm25",                 "2012-12-31",
+      "02280",    "ahrf_pop_density",          "2011-12-31",
+      "02280",    "ahrf_pop_density",          "2012-12-31",
+      "02280",    "ahrf_psych",                "2011-12-31",
+      "02280",    "ahrf_psych",                "2012-12-31",
+      "02280",    "ahrf_rural_urban_code",     "2011-12-31",
+      "02280",    "ahrf_rural_urban_code",     "2012-12-31"
+    ) %>%
+      mutate(time = as.Date(time))
+
+    county_long <- data_standard %>%
+      mutate(time = as.Date(time)) %>%
+      tidyr::pivot_longer(cols = starts_with("ahrf_"), names_to = "measure", values_to = "value") %>%
+      filter(!is.na(value)) %>%
+      anti_join(ahrf_alaska_overrides, by = c("geography", "measure", "time"))
+
+    # Pure counts sum cleanly across counties. Categorical designation codes
+    # (HPSA shortage-area status, USDA rural-urban continuum code) have no
+    # meaningful sum or average at state/national scale and are left out --
+    # they stay county-only. ahrf_pop_density is also excluded: a
+    # population-weighted mean of county densities is NOT equivalent to true
+    # state/national density (total population / total land area) and
+    # systematically overstates it by overweighting dense counties -- e.g.
+    # this approach gives California ~1,796 people/sq mi vs. its actual
+    # ~254, since land area isn't available here as a separate field to
+    # weight by instead. The remaining rate/ratio measures don't have their
+    # raw numerator and denominator available separately either, but a
+    # population-weighted mean is at least a reasonable approximation for
+    # them (unlike density, they aren't defined as a ratio over land area).
+    AHRF_SUM_MEASURES <- c(
+      "ahrf_population", "ahrf_hospitals", "ahrf_critical_access_hosp",
+      "ahrf_pcp", "ahrf_md_all", "ahrf_psych", "ahrf_dentists"
+    )
+    AHRF_WEIGHTED_MEAN_MEASURES <- c(
+      "ahrf_good_air_pct", "ahrf_pm25",
+      "ahrf_medicare_per_capita", "ahrf_ed_per_1k_medicare"
+    )
+
+    pop_lookup <- county_long %>%
+      filter(measure == "ahrf_population") %>%
+      select(geography, time, population = value)
+
+    aggregate_ahrf <- function(df, group_cols) {
+      sum_part <- df %>%
+        filter(measure %in% AHRF_SUM_MEASURES) %>%
+        group_by(across(all_of(group_cols)), measure) %>%
+        summarise(value = sum(value, na.rm = TRUE), .groups = "drop")
+      weighted_part <- df %>%
+        filter(measure %in% AHRF_WEIGHTED_MEAN_MEASURES) %>%
+        left_join(pop_lookup, by = c("geography", "time")) %>%
+        filter(!is.na(population)) %>%
+        group_by(across(all_of(group_cols)), measure) %>%
+        summarise(value = sum(value * population) / sum(population), .groups = "drop")
+      bind_rows(sum_part, weighted_part)
+    }
+
+    state_agg <- county_long %>%
+      mutate(state_fips = substr(geography, 1, 2)) %>%
+      aggregate_ahrf(c("state_fips", "time")) %>%
+      rename(geography = state_fips)
+
+    national_agg <- aggregate_ahrf(county_long, "time") %>%
+      mutate(geography = "00")
+
+    data_standard <- bind_rows(county_long, state_agg, national_agg) %>%
+      mutate(time = format(time, "%Y-%m-%d")) %>%
+      tidyr::pivot_wider(names_from = measure, values_from = value) %>%
+      arrange(geography, time)
+
     vroom::vroom_write(data_standard, "standard/data.csv.gz", delim = ",")
-    message("Wrote ", nrow(data_standard), " rows across ", length(year_dfs), " editions")
+    message(
+      "Wrote ", nrow(data_standard), " rows (county + state + national) across ",
+      length(year_dfs), " editions"
+    )
     process$raw_state <- current_hash
     dcf::dcf_process_record(updated = process)
   } else {
