@@ -693,16 +693,10 @@ if (!identical(process$raw_state, current_hash)) {
     # Pure counts sum cleanly across counties. Categorical designation codes
     # (HPSA shortage-area status, USDA rural-urban continuum code) have no
     # meaningful sum or average at state/national scale and are left out --
-    # they stay county-only. ahrf_pop_density is also excluded: a
-    # population-weighted mean of county densities is NOT equivalent to true
-    # state/national density (total population / total land area) and
-    # systematically overstates it by overweighting dense counties -- e.g.
-    # this approach gives California ~1,796 people/sq mi vs. its actual
-    # ~254, since land area isn't available here as a separate field to
-    # weight by instead. The remaining rate/ratio measures don't have their
-    # raw numerator and denominator available separately either, but a
-    # population-weighted mean is at least a reasonable approximation for
-    # them (unlike density, they aren't defined as a ratio over land area).
+    # they stay county-only. The remaining rate/ratio measures don't have
+    # their raw numerator and denominator available separately here, so a
+    # population-weighted mean is used as an approximation of the true
+    # population-level rate rather than an exact recomputation.
     AHRF_SUM_MEASURES <- c(
       "ahrf_population", "ahrf_hospitals", "ahrf_critical_access_hosp",
       "ahrf_pcp", "ahrf_md_all", "ahrf_psych", "ahrf_dentists"
@@ -715,6 +709,23 @@ if (!identical(process$raw_state, current_hash)) {
     pop_lookup <- county_long %>%
       filter(measure == "ahrf_population") %>%
       select(geography, time, population = value)
+
+    # ahrf_pop_density needs different treatment than the other rate
+    # measures: a population-weighted mean of county densities is NOT
+    # equivalent to true state/national density (total population / total
+    # land area) and systematically overstates it by overweighting dense
+    # counties -- e.g. that approach gives California ~1,796 people/sq mi
+    # vs. its actual ~254. Land area isn't provided as its own field here,
+    # but it can be recovered exactly from the two fields that are (each
+    # county's own population / density), then true density is
+    # sum(population) / sum(implied area) -- no external land-area source
+    # needed, and it reproduces California's real density (~252 vs. ~254)
+    # almost exactly.
+    density_area_lookup <- county_long %>%
+      filter(measure == "ahrf_pop_density", value > 0) %>%
+      select(geography, time, density = value) %>%
+      inner_join(pop_lookup, by = c("geography", "time")) %>%
+      mutate(implied_area = population / density)
 
     aggregate_ahrf <- function(df, group_cols) {
       sum_part <- df %>%
@@ -730,12 +741,30 @@ if (!identical(process$raw_state, current_hash)) {
       bind_rows(sum_part, weighted_part)
     }
 
-    state_agg <- county_long %>%
-      mutate(state_fips = substr(geography, 1, 2)) %>%
-      aggregate_ahrf(c("state_fips", "time")) %>%
-      rename(geography = state_fips)
+    aggregate_density <- function(df, group_cols) {
+      df %>%
+        group_by(across(all_of(group_cols))) %>%
+        summarise(
+          value = sum(population) / sum(implied_area), .groups = "drop"
+        ) %>%
+        mutate(measure = "ahrf_pop_density")
+    }
 
-    national_agg <- aggregate_ahrf(county_long, "time") %>%
+    state_agg <- bind_rows(
+      county_long %>%
+        mutate(state_fips = substr(geography, 1, 2)) %>%
+        aggregate_ahrf(c("state_fips", "time")) %>%
+        rename(geography = state_fips),
+      density_area_lookup %>%
+        mutate(state_fips = substr(geography, 1, 2)) %>%
+        aggregate_density(c("state_fips", "time")) %>%
+        rename(geography = state_fips)
+    )
+
+    national_agg <- bind_rows(
+      aggregate_ahrf(county_long, "time"),
+      aggregate_density(density_area_lookup, "time")
+    ) %>%
       mutate(geography = "00")
 
     data_standard <- bind_rows(county_long, state_agg, national_agg) %>%
