@@ -225,7 +225,45 @@ if (!identical(process$raw_state, current_hash)) {
                  year_4digit = NA_integer_,
                  stringsAsFactors = FALSE)
     })
-    do.call(rbind, Filter(Negate(is.null), rows))
+    fmt <- do.call(rbind, Filter(Negate(is.null), rows))
+
+    # The same SAS file also carries an explicit value-label section
+    # (`varname = "description YYYY"`) giving each variable's true
+    # 4-digit year directly. This is the only reliable way to order
+    # variables chronologically: some editions reuse a 2-digit varname
+    # suffix as a bare internal sequence number rather than a year --
+    # e.g. f1198495 is labeled "Population Estimate 1995", not a
+    # variable newer than f1198421's "Population Estimate 2021" ("95"
+    # sorts higher than "21" as a raw 2-digit integer, but 1995 is 26
+    # years OLDER than 2021). Confirmed to cause a real bug: without
+    # this, find_sas_var's varname-suffix fallback picked f1198495 as
+    # the "highest year" over f1198421, so Lincoln County SD's
+    # ahrf_population came out as 17,666 (the actual 1995 count) instead
+    # of 67,870 (the correct, most recent 2021 count) in the 2021-2022
+    # edition. find_sas_var already prefers year_4digit over the
+    # varname-suffix guess whenever it's non-NA (see below), so
+    # populating it correctly here is the entire fix.
+    label_pat  <- "^(\\S+)\\s*=\\s*\"[^\"]*?(\\d{4})\"\\s*$"
+    label_rows <- lapply(lines, function(ln) {
+      m <- regexec(label_pat, ln, perl = TRUE)
+      r <- regmatches(ln, m)[[1]]
+      if (length(r) == 0) return(NULL)
+      yr <- suppressWarnings(as.integer(r[3]))
+      if (is.na(yr) || yr < 1960L || yr > 2035L) return(NULL)
+      data.frame(varname = r[2], label_year = yr, stringsAsFactors = FALSE)
+    })
+    labels <- do.call(rbind, Filter(Negate(is.null), label_rows))
+
+    if (!is.null(labels) && nrow(labels) > 0L && !is.null(fmt) && nrow(fmt) > 0L) {
+      # A varname's label line is always its own "varname = description
+      # YEAR" line immediately after its @position declaration in every
+      # edition checked; keep the first match if a varname is ever
+      # repeated for some unrelated reason elsewhere in the file.
+      labels <- labels[!duplicated(labels$varname), ]
+      fmt$year_4digit <- labels$label_year[match(fmt$varname, labels$varname)]
+    }
+
+    fmt
   }
 
   # Parse plain-text layout files (pipe-delimited 1999/2007 or space-delimited 2008).
@@ -294,7 +332,27 @@ if (!identical(process$raw_state, current_hash)) {
       yr_num <- suppressWarnings(as.integer(
         substr(hits$varname, nchar(hits$varname) - 1L, nchar(hits$varname))
       ))
-      hits$sort_yr <- ifelse(has_yr & !is.na(yr_num), yr_num, -1L)
+      # Every AHRF edition checked keeps a rolling window of 2-digit-suffix
+      # variables spanning both the 1990s and 2000s+ under the same
+      # description with no year label at all (e.g. f1198401..f1198413
+      # alongside f1198491..f1198499) -- comparing the raw suffix as a bare
+      # integer put "99" above "01", so the 1999 value was picked over the
+      # far more current 2001 one. Confirmed on Henrico County VA (51087):
+      # the 2002 edition's un-labeled "01"-suffix population variable reads
+      # 264,973 (a plausible continuation of the true ~262,300 2000 Census
+      # count) while its "99"-suffix variable -- the one this fallback used
+      # to pick -- reads 244,652. Same pattern confirmed for ahrf_md_all
+      # (suffix "00" reads 1,325, consistent with neighboring years; suffix
+      # "99" reads an implausible 137).
+      #
+      # The pivot below can't sit at the textbook 50: physician-count
+      # variables carry a legacy baseline all the way back to suffix "40"
+      # (1940, e.g. f0885740) -- a <50 pivot would misread that as 2040. The
+      # newest un-labeled suffix seen across every measure and edition
+      # checked is 25 (2025); the oldest legacy suffix is 40 (1940). 30 sits
+      # in that gap with margin on both sides.
+      full_yr <- ifelse(yr_num < 30L, 2000L + yr_num, 1900L + yr_num)
+      hits$sort_yr <- ifelse(has_yr & !is.na(yr_num), full_yr, -1L)
     }
     hits[which.max(hits$sort_yr), ]
   }
