@@ -357,6 +357,29 @@ if (!identical(process$raw_state, current_hash)) {
     hits[which.max(hits$sort_yr), ]
   }
 
+  # Every match, with the data year each one carries. find_sas_var above keeps
+  # only the newest, which discards the back-series every edition holds and
+  # labels the value with the edition year instead of the data year.
+  find_sas_vars <- function(fmt, pattern) {
+    hits <- fmt[grepl(pattern, fmt$desc, ignore.case = TRUE, perl = TRUE), ]
+    if (nrow(hits) == 0) return(NULL)
+
+    if (!is.null(hits$year_4digit) && any(!is.na(hits$year_4digit))) {
+      hits$sort_yr <- ifelse(!is.na(hits$year_4digit), hits$year_4digit, -1L)
+    } else {
+      has_yr <- nchar(hits$varname) >= 8L
+      yr_num2 <- suppressWarnings(as.integer(
+        substr(hits$varname, nchar(hits$varname) - 1L, nchar(hits$varname))
+      ))
+      # Century pivot as in find_sas_var.
+      full_yr <- ifelse(yr_num2 < 30L, 2000L + yr_num2, 1900L + yr_num2)
+      hits$sort_yr <- ifelse(has_yr & !is.na(yr_num2), full_yr, -1L)
+    }
+    # One row per data year; on a repeated year the later position wins.
+    hits <- hits[order(hits$sort_yr, hits$start), ]
+    hits[!duplicated(hits$sort_yr, fromLast = TRUE), ]
+  }
+
   # Variable targets: each entry is list(output_column_name, description_regex)
   # Patterns cover both modern SAS naming and older layout.txt naming conventions.
   targets <- list(
@@ -385,16 +408,26 @@ if (!identical(process$raw_state, current_hash)) {
     if (is.null(fmt) || nrow(fmt) == 0) {
       message("  No parseable format for yr=", yr_num); return(NULL)
     }
+    # The data year is encoded in the column name so it survives read_fwf.
     vars <- lapply(targets, function(t) {
-      v <- find_sas_var(fmt, t[[2]])
+      if (t[[1]] == "fips_st_cnty") {
+        v <- find_sas_var(fmt, t[[2]])
+        if (is.null(v)) return(NULL)
+        v$out_name <- t[[1]]
+        return(v)
+      }
+      v <- find_sas_vars(fmt, t[[2]])
       if (is.null(v)) return(NULL)
-      v$out_name <- t[[1]]
+      # No detectable year means the variable is the edition's own value.
+      v$data_year <- ifelse(is.na(v$sort_yr) | v$sort_yr < 0L, yr_num, v$sort_yr)
+      v$out_name  <- paste0(t[[1]], "@@", v$data_year)
       v
     })
     vars <- Filter(Negate(is.null), vars)
     if (length(vars) == 0) { message("  No matching vars for yr=", yr_num); return(NULL) }
 
-    vdf <- do.call(rbind, vars)
+    vdf <- dplyr::bind_rows(vars)
+    vdf <- vdf[!duplicated(vdf$out_name), ]
 
     result <- readr::read_fwf(
       asc_path,
@@ -423,12 +456,27 @@ if (!identical(process$raw_state, current_hash)) {
           nchar(fips_raw) == 5L ~ fips_raw,
           nchar(fips_raw) == 4L ~ paste0("0", fips_raw),
           TRUE                  ~ NA_character_
-        ),
-        time = paste0(yr_num, "-12-31")
+        )
       ) %>%
       filter(!is.na(geography)) %>%
-      mutate(across(starts_with("ahrf_"), ~ suppressWarnings(as.numeric(.)))) %>%
-      select(geography, time, starts_with("ahrf_"))
+      select(geography, dplyr::any_of(vdf$out_name[vdf$out_name != "fips_st_cnty"])) %>%
+      # pivot_longer refuses mixed types, and the decimal loop above converts
+      # only some columns.
+      mutate(across(-geography, ~ suppressWarnings(as.numeric(.)))) %>%
+      tidyr::pivot_longer(
+        -geography,
+        names_to  = c("measure", "data_year"),
+        names_sep = "@@",
+        values_to = "value"
+      ) %>%
+      filter(!is.na(value)) %>%
+      transmute(
+        geography,
+        time    = paste0(data_year, "-12-31"),
+        measure,
+        value,
+        edition = as.integer(yr_num)
+      )
   }
 
   # Load format from a tech doc zip: try SAS first, fall back to layout.txt.
@@ -495,6 +543,48 @@ if (!identical(process$raw_state, current_hash)) {
   # -------------------------------------------------------------------------
   # 4. CSV parser (component files with dynamic year-suffix column selection)
   # -------------------------------------------------------------------------
+  # Every year-suffixed column, returned long. The CSV editions carry two years
+  # per measure, so reading both lets the newest edition correct the year before.
+  read_all_cols <- function(file, base_col_map) {
+    if (is.null(file)) return(NULL)
+    tryCatch({
+      all_names <- suppressMessages(
+        names(vroom(file, n_max = 0, show_col_types = FALSE))
+      )
+      picks <- list()
+      for (out_nm in names(base_col_map)) {
+        base  <- base_col_map[[out_nm]]
+        pat   <- paste0("^", gsub("\\.", "\\\\.", base), "_\\d{2}$")
+        cands <- all_names[grepl(pat, all_names, ignore.case = TRUE)]
+        for (cd in cands) {
+          yy <- as.integer(sub(".*_", "", cd))
+          picks[[cd]] <- list(
+            measure   = out_nm,
+            data_year = if (yy < 30L) 2000L + yy else 1900L + yy
+          )
+        }
+      }
+      if (length(picks) == 0) return(NULL)
+      df <- suppressMessages(
+        vroom(file, col_select = c("fips_st_cnty", all_of(names(picks))),
+              col_types = list(fips_st_cnty = col_character()),
+              show_col_types = FALSE)
+      )
+      df$fips_st_cnty <- ifelse(
+        nchar(df$fips_st_cnty) == 4L, paste0("0", df$fips_st_cnty), df$fips_st_cnty
+      )
+      out <- lapply(names(picks), function(cd) {
+        tibble(
+          fips_st_cnty = df$fips_st_cnty,
+          measure      = picks[[cd]]$measure,
+          data_year    = picks[[cd]]$data_year,
+          value        = suppressWarnings(as.numeric(df[[cd]]))
+        )
+      })
+      dplyr::bind_rows(out) %>% filter(!is.na(value))
+    }, error = function(e) NULL)
+  }
+
   read_latest_cols <- function(file, base_col_map) {
     if (is.null(file)) return(NULL)
     tryCatch({
@@ -544,50 +634,55 @@ if (!identical(process$raw_state, current_hash)) {
         find_file(tmp_dir, paste0("ahrf", yr_num, sfx, ".*\\.csv$")) %||%
         find_file(tmp_dir, paste0("AHRF", yr_num, sfx, ".*\\.csv$"))
 
-      geo <- read_latest_cols(comp("geo"), c(
+      geo <- read_all_cols(comp("geo"), c(
         ahrf_hpsa_prim_care     = "hpsa_prim_care",
         ahrf_hpsa_dental        = "hpsa_dent",
         ahrf_hpsa_mental_health = "hpsa_mentl_hlth",
         ahrf_rural_urban_code   = "rural_urban_contnm"
       ))
-      hp <- read_latest_cols(comp("hp"), c(
+      hp <- read_all_cols(comp("hp"), c(
         ahrf_pcp      = "phys_nf_prim_care_pc_exc_rsdt",
         ahrf_md_all   = "md_nf_all_pc",
         ahrf_psych    = "md_nf_psych",
         ahrf_dentists = "dent_npi"
       ))
-      hf <- read_latest_cols(comp("hf"), c(
+      hf <- read_all_cols(comp("hf"), c(
         ahrf_hospitals            = "hosp",
         ahrf_critical_access_hosp = "critcl_access_hosp"
       ))
-      pop <- read_latest_cols(comp("pop"), c(ahrf_population = "popn"))
-      env <- read_latest_cols(comp("env"), c(
+      pop <- read_all_cols(comp("pop"), c(ahrf_population = "popn"))
+      env <- read_all_cols(comp("env"), c(
         ahrf_good_air_pct = "good_air_qulty_dys_pct",
         ahrf_pm25         = "annul_partclt_mattr_2_5_avg",
         ahrf_pop_density  = "popn_densty_per_squr_mi"
       ))
-      exp <- read_latest_cols(comp("exp"), c(
+      exp <- read_all_cols(comp("exp"), c(
         ahrf_medicare_per_capita = "actl_per_cap_ffs_cost"
       ))
-      utl <- read_latest_cols(comp("utl"), c(
+      utl <- read_all_cols(comp("utl"), c(
         ahrf_ed_per_1k_medicare = "ed_vists_per_1k_medcr_ffs"
       ))
 
       parts <- Filter(Negate(is.null), list(geo, hp, hf, pop, env, exp, utl))
       if (length(parts) == 0L) return(NULL)
 
-      Reduce(function(a, b) left_join(a, b, by = "fips_st_cnty"), parts) %>%
+      # Components are already long, so they stack rather than join.
+      dplyr::bind_rows(parts) %>%
         mutate(
-          fips_raw  = fips_st_cnty,
           geography = case_when(
-            nchar(fips_raw) == 5L ~ fips_raw,
-            nchar(fips_raw) == 4L ~ paste0("0", fips_raw),
-            TRUE                  ~ NA_character_
-          ),
-          time = paste0(yr_num, "-12-31")
+            nchar(fips_st_cnty) == 5L ~ fips_st_cnty,
+            nchar(fips_st_cnty) == 4L ~ paste0("0", fips_st_cnty),
+            TRUE                       ~ NA_character_
+          )
         ) %>%
         filter(!is.na(geography)) %>%
-        select(geography, time, starts_with("ahrf_"))
+        transmute(
+          geography,
+          time    = paste0(data_year, "-12-31"),
+          measure,
+          value,
+          edition = as.integer(yr_num)
+        )
     }, error = function(e) {
       message("  Error CSV yr=", yr_num, ": ", e$message); NULL
     })
@@ -628,9 +723,9 @@ if (!identical(process$raw_state, current_hash)) {
     }
 
     if (!is.null(result) && nrow(result) > 0L) {
-      result <- result %>%
-        mutate(across(starts_with("ahrf_"), ~ suppressWarnings(as.numeric(.))))
-      message("  -> ", nrow(result), " rows")
+      message("  -> ", nrow(result), " obs across ",
+              length(unique(result$time)), " data year(s), ",
+              length(unique(result$measure)), " measure(s)")
       year_dfs[[as.character(ed$yr)]] <- result
     } else {
       message("  -> no data")
@@ -647,7 +742,37 @@ if (!identical(process$raw_state, current_hash)) {
   #    separate per-level files.
   # -------------------------------------------------------------------------
   if (length(year_dfs) > 0L) {
-    data_standard <- bind_rows(year_dfs) %>% arrange(geography, time)
+    # Assemble by data year, newest edition winning. Editions overlap and
+    # restate history, so the same (geography, year, measure) is published more
+    # than once; the newest edition is the publisher's current view of it.
+    # Only ahrf_md_all reaches before 1970, and thinly.
+    AHRF_FIRST_YEAR <- 1970L
+
+    long_all <- bind_rows(year_dfs) %>%
+      filter(as.integer(substr(time, 1, 4)) >= AHRF_FIRST_YEAR)
+
+    n_before <- nrow(long_all)
+    long_resolved <- long_all %>%
+      arrange(geography, time, measure, desc(edition)) %>%
+      distinct(geography, time, measure, .keep_all = TRUE)
+
+    restated <- long_all %>%
+      group_by(geography, time, measure) %>%
+      summarise(n_ed = n(), n_val = n_distinct(value), .groups = "drop") %>%
+      filter(n_ed > 1L, n_val > 1L)
+
+    message(
+      "\nAssembled by data year: ", format(n_before, big.mark = ","),
+      " observations from ", length(year_dfs), " editions -> ",
+      format(nrow(long_resolved), big.mark = ","), " resolved; ",
+      format(nrow(restated), big.mark = ","),
+      " (measure, geography, year) cells were restated between editions"
+    )
+
+    data_standard <- long_resolved %>%
+      select(-edition) %>%
+      tidyr::pivot_wider(names_from = measure, values_from = value) %>%
+      arrange(geography, time)
 
     # Retired Alaska borough/census-area FIPS codes for which AHRF sometimes
     # duplicates and sometimes disagrees with the current successor(s) for
@@ -656,97 +781,56 @@ if (!identical(process$raw_state, current_hash)) {
     # in this file, and the state/national aggregates below) gets clean,
     # non-duplicated data rather than each downstream repo needing its own
     # copy of this table.
-    ahrf_alaska_overrides <- tribble(
-      ~geography, ~measure,                    ~time,
-      "02063",    "ahrf_critical_access_hosp", "2023-12-31",
-      "02063",    "ahrf_hospitals",            "2023-12-31",
-      "02063",    "ahrf_hpsa_dental",          "2025-12-31",
-      "02063",    "ahrf_hpsa_mental_health",   "2025-12-31",
-      "02063",    "ahrf_hpsa_prim_care",       "2025-12-31",
-      "02066",    "ahrf_critical_access_hosp", "2023-12-31",
-      "02066",    "ahrf_hospitals",            "2023-12-31",
-      "02066",    "ahrf_hpsa_dental",          "2025-12-31",
-      "02066",    "ahrf_hpsa_mental_health",   "2025-12-31",
-      "02066",    "ahrf_hpsa_prim_care",       "2025-12-31",
-      "02105",    "ahrf_population",           "2011-12-31",
-      "02105",    "ahrf_population",           "2012-12-31",
-      "02195",    "ahrf_md_all",               "2011-12-31",
-      "02195",    "ahrf_md_all",               "2012-12-31",
-      "02195",    "ahrf_population",           "2011-12-31",
-      "02195",    "ahrf_population",           "2012-12-31",
-      "02198",    "ahrf_md_all",               "2011-12-31",
-      "02198",    "ahrf_md_all",               "2012-12-31",
-      "02198",    "ahrf_population",           "2011-12-31",
-      "02198",    "ahrf_population",           "2012-12-31",
-      "02201",    "ahrf_critical_access_hosp", "2011-12-31",
-      "02201",    "ahrf_critical_access_hosp", "2012-12-31",
-      "02201",    "ahrf_dentists",             "2011-12-31",
-      "02201",    "ahrf_dentists",             "2012-12-31",
-      "02201",    "ahrf_good_air_pct",         "2012-12-31",
-      "02201",    "ahrf_hospitals",            "2011-12-31",
-      "02201",    "ahrf_hospitals",            "2012-12-31",
-      "02201",    "ahrf_pcp",                  "2011-12-31",
-      "02201",    "ahrf_pcp",                  "2012-12-31",
-      "02201",    "ahrf_pm25",                 "2012-12-31",
-      "02201",    "ahrf_pop_density",          "2011-12-31",
-      "02201",    "ahrf_pop_density",          "2012-12-31",
-      "02201",    "ahrf_psych",                "2011-12-31",
-      "02201",    "ahrf_psych",                "2012-12-31",
-      "02201",    "ahrf_rural_urban_code",     "2011-12-31",
-      "02201",    "ahrf_rural_urban_code",     "2012-12-31",
-      "02230",    "ahrf_population",           "2011-12-31",
-      "02230",    "ahrf_population",           "2012-12-31",
-      "02232",    "ahrf_critical_access_hosp", "2011-12-31",
-      "02232",    "ahrf_critical_access_hosp", "2012-12-31",
-      "02232",    "ahrf_dentists",             "2011-12-31",
-      "02232",    "ahrf_dentists",             "2012-12-31",
-      "02232",    "ahrf_good_air_pct",         "2012-12-31",
-      "02232",    "ahrf_hospitals",            "2011-12-31",
-      "02232",    "ahrf_hospitals",            "2012-12-31",
-      "02232",    "ahrf_md_all",               "2011-12-31",
-      "02232",    "ahrf_md_all",               "2012-12-31",
-      "02232",    "ahrf_medicare_per_capita",  "2014-12-31",
-      "02232",    "ahrf_pcp",                  "2011-12-31",
-      "02232",    "ahrf_pcp",                  "2012-12-31",
-      "02232",    "ahrf_pm25",                 "2012-12-31",
-      "02232",    "ahrf_pop_density",          "2011-12-31",
-      "02232",    "ahrf_pop_density",          "2012-12-31",
-      "02232",    "ahrf_psych",                "2011-12-31",
-      "02232",    "ahrf_psych",                "2012-12-31",
-      "02232",    "ahrf_rural_urban_code",     "2011-12-31",
-      "02232",    "ahrf_rural_urban_code",     "2012-12-31",
-      "02261",    "ahrf_critical_access_hosp", "2024-12-31",
-      "02261",    "ahrf_hospitals",            "2024-12-31",
-      "02261",    "ahrf_critical_access_hosp", "2025-12-31",
-      "02261",    "ahrf_hospitals",            "2025-12-31",
-      "02275",    "ahrf_md_all",               "2011-12-31",
-      "02275",    "ahrf_md_all",               "2012-12-31",
-      "02275",    "ahrf_population",           "2011-12-31",
-      "02275",    "ahrf_population",           "2012-12-31",
-      "02280",    "ahrf_critical_access_hosp", "2011-12-31",
-      "02280",    "ahrf_critical_access_hosp", "2012-12-31",
-      "02280",    "ahrf_dentists",             "2011-12-31",
-      "02280",    "ahrf_dentists",             "2012-12-31",
-      "02280",    "ahrf_good_air_pct",         "2012-12-31",
-      "02280",    "ahrf_hospitals",            "2011-12-31",
-      "02280",    "ahrf_hospitals",            "2012-12-31",
-      "02280",    "ahrf_pcp",                  "2011-12-31",
-      "02280",    "ahrf_pcp",                  "2012-12-31",
-      "02280",    "ahrf_pm25",                 "2012-12-31",
-      "02280",    "ahrf_pop_density",          "2011-12-31",
-      "02280",    "ahrf_pop_density",          "2012-12-31",
-      "02280",    "ahrf_psych",                "2011-12-31",
-      "02280",    "ahrf_psych",                "2012-12-31",
-      "02280",    "ahrf_rural_urban_code",     "2011-12-31",
-      "02280",    "ahrf_rural_urban_code",     "2012-12-31"
-    ) %>%
-      mutate(time = as.Date(time))
+    # Keep whichever generation was in effect for the data year: a retired area
+    # is valid up to its dissolution, its successors from that date on. Replaces
+    # a hand-listed set of rows keyed on edition years, which has no data-year
+    # equivalent. Dates match GEOGRAPHY_LINEAGE in us-rates/geography_helpers.R.
+    ak_lineage <- list(
+      list(gens = list("02231", "02232", c("02230", "02105")),
+           eff  = c(NA, "2007-06-20")),
+      list(gens = list("02201", "02198"),            eff = c("2008-05-19")),
+      list(gens = list("02280", c("02195", "02275")), eff = c("2008-06-01")),
+      list(gens = list("02270", "02158"),            eff = c("2015-07-01")),
+      list(gens = list("02261", c("02063", "02066")), eff = c("2019-01-02"))
+    )
+
+    validity <- dplyr::bind_rows(lapply(ak_lineage, function(ln) {
+      n <- length(ln$gens)
+      dplyr::bind_rows(lapply(seq_len(n), function(i) {
+        from <- if (i == 1L) as.Date("1900-01-01") else as.Date(ln$eff[i - 1L])
+        to   <- if (i == n)  as.Date("2999-12-31") else as.Date(ln$eff[i])
+        # 02231 -> 02232 predates the change logs; leave that window open.
+        if (is.na(from)) from <- as.Date("1900-01-01")
+        if (is.na(to))   to   <- as.Date("2999-12-31")
+        tibble(geography = ln$gens[[i]], gen = i, valid_from = from, valid_to = to)
+      }))
+    }))
 
     county_long <- data_standard %>%
       mutate(time = as.Date(time)) %>%
       tidyr::pivot_longer(cols = starts_with("ahrf_"), names_to = "measure", values_to = "value") %>%
-      filter(!is.na(value)) %>%
-      anti_join(ahrf_alaska_overrides, by = c("geography", "measure", "time"))
+      filter(!is.na(value))
+
+    n_pre <- nrow(county_long)
+
+    ak_rows <- county_long %>% inner_join(validity, by = "geography")
+    ak_keep <- ak_rows %>%
+      filter(time >= valid_from, time < valid_to) %>%
+      # For the undated boundary: if two generations claim a year, take the later.
+      group_by(measure, time, valid_from) %>%
+      filter(gen == max(gen)) %>%
+      ungroup() %>%
+      select(-gen, -valid_from, -valid_to)
+
+    county_long <- county_long %>%
+      anti_join(validity, by = "geography") %>%
+      bind_rows(ak_keep)
+
+    message(
+      "Alaska lineage resolved by data year: ", format(nrow(ak_rows), big.mark = ","),
+      " rows on lineage geographies -> ", format(nrow(ak_keep), big.mark = ","),
+      " kept (", format(n_pre - nrow(county_long), big.mark = ","), " dropped as out-of-era)"
+    )
 
     # Pure counts sum cleanly across counties. Categorical designation codes
     # (HPSA shortage-area status, USDA rural-urban continuum code) have no
