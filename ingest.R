@@ -588,45 +588,6 @@ if (!identical(process$raw_state, current_hash)) {
     }, error = function(e) NULL)
   }
 
-  read_latest_cols <- function(file, base_col_map) {
-    if (is.null(file)) return(NULL)
-    tryCatch({
-      all_names     <- suppressMessages(
-        names(vroom(file, n_max = 0, show_col_types = FALSE))
-      )
-      select_actual <- character(0)
-      rename_to     <- character(0)
-      for (out_nm in names(base_col_map)) {
-        base  <- base_col_map[[out_nm]]
-        pat   <- paste0("^", gsub("\\.", "\\\\.", base), "_\\d{2}$")
-        cands <- all_names[grepl(pat, all_names, ignore.case = TRUE)]
-        if (length(cands) == 0) next
-        yrs  <- as.integer(sub(".*_", "", cands))
-        best <- cands[which.max(yrs)]
-        select_actual <- c(select_actual, best)
-        rename_to    <- c(rename_to, out_nm)
-      }
-      if (length(select_actual) == 0) return(NULL)
-      df <- suppressMessages(
-        vroom(file, col_select = c("fips_st_cnty", all_of(select_actual)),
-              col_types = list(fips_st_cnty = col_character()),
-              show_col_types = FALSE)
-      )
-      names(df)[match(select_actual, names(df))] <- rename_to
-      # Some component CSVs (e.g. the 2024 edition's "geo" file) drop the
-      # leading zero on fips_st_cnty for states 01-09, giving a 4-char code
-      # ("1001") instead of 5 ("01001"). Left uncorrected here, the later
-      # Reduce(left_join, ...) across components fails to match those rows
-      # against components that kept the leading zero, silently NA-ing out
-      # every measure except the ones sourced from this file. Normalize
-      # before returning so every component joins on the same key.
-      df$fips_st_cnty <- ifelse(
-        nchar(df$fips_st_cnty) == 4L, paste0("0", df$fips_st_cnty), df$fips_st_cnty
-      )
-      df
-    }, error = function(e) NULL)
-  }
-
   parse_csv_zip <- function(zip_path, yr_num) {
     tmp_dir <- tempfile(); dir.create(tmp_dir)
     on.exit(unlink(tmp_dir, recursive = TRUE))
