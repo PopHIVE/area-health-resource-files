@@ -565,9 +565,12 @@ if (!identical(process$raw_state, current_hash)) {
         }
       }
       if (length(picks) == 0) return(NULL)
+      # Read as text: vroom guesses each column's type from the first rows, so a
+      # count column that is 0/1 early on is typed as logical and its later
+      # decimal values are dropped as parse failures. as.numeric() below converts.
       df <- suppressMessages(
         vroom(file, col_select = c("fips_st_cnty", all_of(names(picks))),
-              col_types = list(fips_st_cnty = col_character()),
+              col_types = readr::cols(.default = readr::col_character()),
               show_col_types = FALSE)
       )
       df$fips_st_cnty <- ifelse(
@@ -641,16 +644,48 @@ if (!identical(process$raw_state, current_hash)) {
         ahrf_rural_urban_code   = "rural_urban_contnm"
       ))
       hp <- read_all_cols(comp("hp"), c(
-        ahrf_pcp      = "phys_nf_prim_care_pc_exc_rsdt",
-        ahrf_md_all   = "md_nf_all_pc",
-        ahrf_psych    = "md_nf_psych",
-        ahrf_dentists = "dent_npi"
+        ahrf_pcp         = "phys_nf_prim_care_pc_exc_rsdt",
+        ahrf_md_all      = "md_nf_all_pc",
+        ahrf_psych       = "md_nf_psych",
+        ahrf_dentists    = "dent_npi",
+        ahrf_obgyn_nf_do = "do_nf_obgyn_gen_all_pc",
+        ahrf_obgyn_nf_md = "md_nf_obgyn_gen_all_pc"
       ))
       hf <- read_all_cols(comp("hf"), c(
-        ahrf_hospitals            = "hosp",
-        ahrf_critical_access_hosp = "critcl_access_hosp"
+        ahrf_hospitals                 = "hosp",
+        ahrf_critical_access_hosp      = "critcl_access_hosp",
+        ahrf_obstetric_hospitals       = "stgh_obstetrc_care",
+        ahrf_obstetric_beds            = "stgh_obstetrcs_care_beds",
+        ahrf_neonatal_icu_hospitals    = "stgh_neonat_icu",
+        ahrf_neonatal_icu_beds         = "stgh_neonat_icu_beds",
+        ahrf_neonatal_interm_hospitals = "stgh_neonat_interm_care",
+        ahrf_neonatal_interm_beds      = "stgh_neonat_interm_care_beds",
+        ahrf_birth_room_hospitals      = "stgh_birth_postprtm_rm",
+        ahrf_teen_outreach_hospitals   = "stgh_teen_outrch_svc"
       ))
-      pop <- read_all_cols(comp("pop"), c(ahrf_population = "popn"))
+      # Maternal and infant measures come from the 2023+ CSV editions only.
+      pop <- read_all_cols(comp("pop"), c(
+        ahrf_population             = "popn",
+        ahrf_births                 = "births_3yr_avg",
+        ahrf_births_wh              = "births_3yr_wh_avg",
+        ahrf_births_bl              = "births_3yr_bl_avg",
+        ahrf_births_hsp             = "births_3yr_hsp_avg",
+        ahrf_births_oth             = "births_3yr_oth_avg",
+        ahrf_births_pretrm          = "births_pretrm_3yr_avg",
+        ahrf_births_to_teens        = "births_to_teens_3yr_lt18_avg",
+        ahrf_low_birth_wgt          = "lo_birth_wgt_3yr_avg",
+        ahrf_very_low_birth_wgt     = "very_lo_birth_wgt_3yr_avg",
+        ahrf_inf_mort_rate          = "inf_mort_rate_5yr_lt1_avg",
+        ahrf_infant_deaths          = "mort_age_yr_3yr_lt1_avg",
+        ahrf_infant_deaths_fem_wh   = "inf_deth_3yr_fem_wh_lt1_avg",
+        ahrf_infant_deaths_fem_bl   = "inf_deth_3yr_fem_bl_lt1_avg",
+        ahrf_infant_deaths_fem_hsp  = "inf_deth_3yr_fem_hsp_lt1_avg",
+        ahrf_infant_deaths_fem_oth  = "oth_inf_deth_3yr_fem_lt1_avg",
+        ahrf_infant_deaths_mal_wh   = "inf_deth_3yr_mal_wh_lt1_avg",
+        ahrf_infant_deaths_mal_bl   = "inf_deth_3yr_mal_bl_lt1_avg",
+        ahrf_infant_deaths_mal_hsp  = "inf_deth_3yr_mal_hsp_lt1_avg",
+        ahrf_infant_deaths_mal_oth  = "oth_inf_deth_3yr_mal_lt1_avg"
+      ))
       env <- read_all_cols(comp("env"), c(
         ahrf_good_air_pct = "good_air_qulty_dys_pct",
         ahrf_pm25         = "annul_partclt_mattr_2_5_avg",
@@ -839,9 +874,25 @@ if (!identical(process$raw_state, current_hash)) {
     # their raw numerator and denominator available separately here, so a
     # population-weighted mean is used as an approximation of the true
     # population-level rate rather than an exact recomputation.
+    # Maternal and infant counts are sums too. ahrf_inf_mort_rate is a rate and
+    # is left county-only: a state rate needs pooled infant deaths over births,
+    # which this approximation can't reproduce.
     AHRF_SUM_MEASURES <- c(
       "ahrf_population", "ahrf_hospitals", "ahrf_critical_access_hosp",
-      "ahrf_pcp", "ahrf_md_all", "ahrf_psych", "ahrf_dentists"
+      "ahrf_pcp", "ahrf_md_all", "ahrf_psych", "ahrf_dentists",
+      "ahrf_births", "ahrf_births_wh", "ahrf_births_bl", "ahrf_births_hsp",
+      "ahrf_births_oth", "ahrf_births_pretrm", "ahrf_births_to_teens",
+      "ahrf_low_birth_wgt", "ahrf_very_low_birth_wgt",
+      "ahrf_infant_deaths",
+      "ahrf_infant_deaths_fem_wh", "ahrf_infant_deaths_fem_bl",
+      "ahrf_infant_deaths_fem_hsp", "ahrf_infant_deaths_fem_oth",
+      "ahrf_infant_deaths_mal_wh", "ahrf_infant_deaths_mal_bl",
+      "ahrf_infant_deaths_mal_hsp", "ahrf_infant_deaths_mal_oth",
+      "ahrf_obstetric_hospitals", "ahrf_obstetric_beds",
+      "ahrf_neonatal_icu_hospitals", "ahrf_neonatal_icu_beds",
+      "ahrf_neonatal_interm_hospitals", "ahrf_neonatal_interm_beds",
+      "ahrf_birth_room_hospitals", "ahrf_teen_outreach_hospitals",
+      "ahrf_obgyn_nf_md", "ahrf_obgyn_nf_do"
     )
     AHRF_WEIGHTED_MEAN_MEASURES <- c(
       "ahrf_good_air_pct", "ahrf_pm25",
